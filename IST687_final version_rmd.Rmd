@@ -1,0 +1,491 @@
+---
+title: "Final_project_Group6"
+author: "Wanhsin"
+date: "2024-04-22"
+output: html_document
+---
+
+```{r library,warning=FALSE,message=FALSE}
+library(arrow)
+library(tidyverse)
+library(lobstr)
+library(imputeTS)
+library(RCurl)
+library(httr)
+library(xml2)
+library(corrplot)
+library(readr)
+library(stringr)
+library(dplyr)
+library(caret)
+library(recipes)
+library(ggplot2)
+library(shapviz)
+library(readr)
+library(psych)
+library(rvest)
+library(lubridate)
+library(janitor)
+library(rpart)
+library("rpart.plot")
+library(e1071)
+library(kernlab)
+library(data.table)
+library(MASS)
+library(glmnet)
+library(corrr)
+```
+
+```{r static house data}
+# Reading static house data
+static_house_info <- as.data.frame(read_parquet("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/static_house_info.parquet"))
+df_describe <- describe(static_house_info)
+```
+
+```{r merge data}
+# Form a table for data modeling
+a=1
+b=5710
+for (i in c(1:nrow(static_house_cleaned))[a:b]){
+  bldg_id=as.numeric(static_house_cleaned$bldg_id[i])
+  county=as.character(static_house_cleaned$county[i])
+  # Retrieve energy data
+  temp_energy_usage=read_parquet(paste('https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/',bldg_id,'.parquet',sep=''))
+  temp_energy_usage$bldg_id=as.character(bldg_id)
+  tz=tz(temp_energy_usage$time)
+  temp_energy_usage=temp_energy_usage %>% filter(month(time)==7)
+  temp_energy_usage=temp_energy_usage[,c(44,43,1:42)]
+  temp_energy_usage$total=rowSums(temp_energy_usage[3:44])
+  # Retrieve weather data
+  temp_weather=read_csv(paste('https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/',county,'.csv',sep=''),show_col_types = FALSE)
+  temp_weather$date_time=as.POSIXct(temp_weather$date_time,tz=tz) 
+  # check time zone is the same
+  temp_weather=temp_weather%>%filter(month(date_time)==7)
+  temp_weather=temp_weather%>%rename(time=date_time)
+  temp_weather$county=county
+  temp_weather=temp_weather[,c(1,9,2:8)]
+  # Form a table for data modeling (1 house included)
+  temp_1house=left_join(temp_energy_usage,temp_weather,by='time')
+  static_house_cleaned$bldg_id=as.character(static_house_cleaned$bldg_id)
+  temp_1house$bldg_id=as.character(temp_1house$bldg_id)
+  temp_1house=left_join(temp_1house,static_house_cleaned[1,],by=c('bldg_id','county'))
+  if (i==a){
+    model_table=temp_1house
+  }else{model_table=rbind(model_table,temp_1house)}
+  print(paste(as.character(round((i-a)/(b-a),digits=4)*100),'%',sep='') )
+  # Remove temp data
+  rm(temp_energy_usage,temp_weather,temp_1house,i,bldg_id,county)
+}
+
+write.csv(model_table, "D:/SU/IST 687/datareproce/cleaned_total_combined_data_po.csv")
+```
+
+
+```{r read the file,message=FALSE}
+df_test <- as.data.frame(read_csv("D:/SU/IST 687/datareproce/cleaned_total_combined_data_po.csv"))
+```
+
+```{r Clean Name}
+# clean the name for easier life
+df_clean_test <- clean_names(df_test)
+```
+
+```{r convert data type}
+# convert all character into factor
+df_clean_test <- df_clean_test %>%
+  mutate(across(where(is.character), as.factor))
+
+# check the type
+str(df_clean_test)
+```
+
+
+
+```{r prepare data for modeling}
+# select only num, time, variables with more than 1 factor level
+filtered_df <- df_clean_test %>%
+  select_if(~is.numeric(.) || (is.factor(.) && nlevels(.) > 1) || inherits(., "POSIXct"))
+
+# make sure time in POSIXct format
+filtered_df$time <- as.POSIXct(filtered_df$time, format = "%Y-%m-%d %H:%M:%S")
+
+# extract %H into a variable
+filtered_df$hour <- format(filtered_df$time, "%H")
+
+# change hour to factor
+filtered_df$hour <- as.factor(filtered_df$hour)
+```
+
+```{r Basic descriptive statistics}
+df_describe <- as.data.frame(describe(filtered_df))
+```
+
+```{r PCA}
+# use PCA to see which components are important
+# Check for missing values
+sum(is.na(filtered_df))
+
+# If necessary, handle missing values, for example, by imputing or removing them
+filtered_df_scaled <- na.omit(filtered_df)  # Removing rows with NA values
+
+# Standardize the data (important if variables are measured in different scales)
+filtered_df_scaled_1 <- scale(filtered_df_scaled[, sapply(filtered_df_scaled, is.numeric)])  # Default: center = TRUE, scale = TRUE
+
+pca_result <- prcomp(filtered_df_scaled_1, center = TRUE, scale. = TRUE)
+
+loadings <- pca_result$rotation
+
+# Analyzing how other variables correlate with 'total_energy_consumption'
+loadings['total_energy_consumption',]
+loadings_df <- as.data.frame(loadings)
+loadings_df$PC <- rownames(loadings_df)
+colnames(loadings_df) <- c("Loading", "Principal Component")
+
+
+loadings_df$AbsoluteLoading <- abs(loadings_df$Loading)
+loadings_df_sorted <- loadings_df[order(-loadings_df$AbsoluteLoading), ]
+# view df to see which variables are important
+print(loadings_df_sorted)
+```
+
+```{r linear model}
+# use lm() to fit a linear model, 
+lm_train1 <- lm(log(total_energy_consumption) ~ 
+              dry_bulb_temperature_c + direct_normal_radiation_w_m2 + relative_humidity_percent 
+              + hour + in_city 
+              + in_sqft
+              + in_lighting
+              + in_vacancy_status
+              + in_plug_load_diversity
+              + in_hvac_cooling_efficiency
+              + in_heating_fuel
+              + in_insulation_floor
+              + in_cooling_setpoint
+              + in_income_recs_2020
+              + in_pv_system_size
+              + in_geometry_stories
+              + in_ducts
+              + in_occupants
+              + in_vintage
+              + in_reeds_balancing_area
+              + in_weather_file_latitude
+              + in_bedrooms
+            , data = filtered_df)
+
+# structure of lm
+summary(lm_train1)
+```
+
+```{r create predictions with our lm}
+# assume temperature +5 degree
+filtered_df_1 <- filtered_df %>%
+  mutate(dry_bulb_temperature_c = dry_bulb_temperature_c +5)
+
+filtered_df_1$predictions <- exp(predict(lm_train1, newdata=filtered_df_1))
+```
+
+
+```{r Average Energy Consumption per Sqft by Duct Category}
+# calculate energy consumption based on in_sqft and in_ducts
+average_energy_by_duct_sqft <- filtered_df %>%
+  group_by(in_ducts) %>%
+  summarise(
+    average_energy_per_sqft = sum(total_energy_consumption, na.rm = TRUE) / sum(in_sqft, na.rm = TRUE)
+  ) %>%
+  arrange(desc(average_energy_per_sqft))
+
+# plot bar chart
+ggplot(average_energy_by_duct_sqft, aes(x = reorder(in_ducts, -average_energy_per_sqft), y = average_energy_per_sqft)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(x = "Duct Insulation and Leakage Category", y = "Average Energy Consumption per Sqft") +
+  theme_minimal() +
+  coord_flip() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Average Energy Consumption per Sqft by Duct Category")
+```
+
+```{r Prediction of changing duct insulation type}
+# change 20% Leakage, Uninsulated to 20% Leakage, R-8
+levels(filtered_df_2$in_ducts)[levels(filtered_df_2$in_ducts) == "20% Leakage, Uninsulated"] <- "20% Leakage, R-8"
+
+# increase the temperature
+filtered_df_2 <- filtered_df %>%
+  mutate(dry_bulb_temperature_c = dry_bulb_temperature_c +5)
+
+# use the model
+filtered_df_2$predictions <- exp(predict(lm_train2, newdata=filtered_df_2))
+
+# calculate how much energy save
+sum(filtered_df_2$predictions)-sum(filtered_df_1$predictions)
+```
+
+
+```{r Average Energy Consumption by Building Age and Size}
+# calculation consumption based on in_vintage and in_sqft
+average_consumption_by_vintage <- filtered_df %>%
+  group_by(in_vintage) %>%
+  summarise(
+    avg_total_energy_consumption = mean(total_energy_consumption, na.rm = TRUE),
+    avg_sqft = mean(in_sqft, na.rm = TRUE)
+  ) %>%
+  ungroup()
+# plot
+ggplot(average_consumption_by_vintage, aes(x = in_vintage, y = avg_total_energy_consumption, size = avg_sqft)) +
+  geom_point(aes(color = in_vintage), alpha = 0.6) +
+  scale_size_area(max_size = 20) +
+  labs(title = "Average Energy Consumption by Building Age and Size",
+        x = "Building Vintage (Construction Period)", 
+       y = "Average Total Energy Consumption (Units)",
+       size = "Average Floor Area (Sqft)",
+       color = "Building Vintage") +
+  theme_minimal() +
+  theme(legend.position = "bottom", 
+        legend.direction = "horizontal",
+        legend.box = "vertical",  
+        legend.box.margin = margin(6, 6, 6, 6),
+        legend.margin = margin(0, 0, -10, 0)) +  
+  scale_color_brewer(type = 'qual', palette = "Paired") +
+  guides(size = guide_legend(order = 1), color = guide_legend(order = 2)) +
+  coord_cartesian(ylim = c(0, 1.6))  # set y from 0-1.6
+```
+
+```{r Average Predicted Energy Consumption by Hour for Top and Bottom Cities}
+# remove items, which are not city name
+filtered_df_clean <- filtered_df_1 %>%
+  filter(!in_city %in% c("In another census Place", "Not in a census Place"))
+
+# calculate the average consumption based on city and hour
+average_consumption <- filtered_df_clean %>%
+  group_by(in_city, hour) %>%
+  summarise(avg_predictions = mean(predictions, na.rm = TRUE)) %>%
+  ungroup()
+
+# confirm the calculation
+city_rankings <- average_consumption %>%
+  group_by(in_city) %>%
+  summarise(total_avg_consumption = mean(avg_predictions, na.rm = TRUE)) %>%
+  ungroup()
+
+# select the top and bottom 3 cities
+top_cities <- city_rankings %>%
+  top_n(3, total_avg_consumption) %>%
+  pull(in_city)
+bottom_cities <- city_rankings %>%
+  top_n(-3, total_avg_consumption) %>%
+  pull(in_city)
+selected_cities <- c(top_cities, bottom_cities)
+
+# filter the dataframe (leave only top 3 and bottom 3)
+filtered_data <- average_consumption %>%
+  filter(in_city %in% selected_cities)
+
+# plot line chart
+ggplot(filtered_data, aes(x = hour, y = avg_predictions, group = in_city, color = in_city)) +
+  geom_line() +
+  scale_x_continuous(breaks = 0:23) +  # make x-axis to 0-23
+  labs(title = "Average Predicted Energy Consumption by Hour for Top and Bottom Cities", 
+       x = "Hour of the Day", 
+       y = "Predicted Energy Consumption (Units)", 
+       color = "City") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r Heatmap of Predicted Peak Energy Demand by Hour and City}
+# remove items, which are not city name
+filtered_df_clean <- filtered_df_1 %>%
+  filter(!in_city %in% c("In another census Place", "Not in a census Place"))
+
+# calculate the average consumption based on city and hour
+average_consumption <- filtered_df_clean %>%
+  group_by(in_city, hour) %>%
+  summarise(avg_predictions = mean(predictions, na.rm = TRUE)) %>%
+  ungroup()
+
+# plot heatmap
+ggplot(average_consumption, aes(x = hour, y = in_city, fill = avg_predictions)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "green", high = "red", mid = "yellow", midpoint = median(average_consumption$avg_predictions, na.rm = TRUE), limit = range(average_consumption$avg_predictions), space = "Lab", name="Predicted\nEnergy Demand\n(kWh)") +
+  labs(title = "Heatmap of Predicted Peak Energy Demand by Hour and City", 
+       x = "Hour of the Day", 
+       y = "City") +
+  scale_x_continuous(breaks = 0:23) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        legend.position = "right")
+```
+
+
+
+```{r Lighting Type Proportion by Building Vintage}
+# Count the number based on in_vintage and in_lighting
+vintage_lighting_counts <- filtered_df %>%
+  count(in_vintage, in_lighting)
+
+# Plot bar chart
+ggplot(vintage_lighting_counts, aes(x = in_vintage, y = n, fill = in_lighting)) +
+  geom_bar(stat = "identity", position = "fill") +  
+  scale_y_continuous(labels = scales::percent) +  # change y-axis to percentage
+  labs(title = "Lighting Type Proportion by Building Vintage",
+       x = "Building Vintage",
+       y = "Proportion of Lighting Type",
+       fill = "Lighting Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+```{r Average Energy Consumption by HVAC Cooling Type}
+# energy usage of different type HVAC
+average_consumption_by_type <- filtered_df %>%
+  group_by(in_hvac_cooling_type) %>%
+  summarise(avg_total_energy = mean(total_energy_consumption, na.rm = TRUE)) %>%
+  ungroup()
+
+# Plot bar chart
+ggplot(average_consumption_by_type, aes(x = in_hvac_cooling_type, y = avg_total_energy, fill = in_hvac_cooling_type)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Average Energy Consumption by HVAC Cooling Type",
+       x = "HVAC Cooling Type",
+       y = "Average Total Energy Consumption (Units)",
+       fill = "HVAC Cooling Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))  # 
+```
+
+```{r Average Energy Consumption by Cooling Setpoint}
+agg_data <- filtered_df %>%
+  group_by(in_cooling_setpoint) %>%
+  summarise(avg_energy = mean(total_energy_consumption, na.rm = TRUE))
+
+ggplot(agg_data, aes(x = in_cooling_setpoint, y = avg_energy)) +
+  geom_line(color = "blue") +
+  geom_point() +
+  labs(x = "Cooling Setpoint (°F)", y = "Average Total Energy Consumption (units)", title = "Average Energy Consumption by Cooling Setpoint") +
+  ylim(1,2)+
+  theme_minimal()
+```
+
+
+```{r Average Energy Consumption by Heating Setpoint}
+# Assuming 'filtered_df' is your dataframe, and it has 'in_heating_setpoint' and 'total_energy_consumption' columns.
+
+# Calculate average energy consumption for each heating setpoint
+avg_energy_by_setpoint <- filtered_df %>%
+  filter(in_heating_setpoint != 55 & in_heating_setpoint != 60 & in_heating_setpoint != 62) %>%  # Exclude setpoint 55
+  group_by(in_heating_setpoint) %>%
+  summarise(avg_energy_consumption = mean(total_energy_consumption, na.rm = TRUE)) %>%
+  arrange(in_heating_setpoint)  # Make sure the setpoints are in order
+
+# Generate a line plot
+ggplot(avg_energy_by_setpoint, aes(x = in_heating_setpoint, y = avg_energy_consumption)) +
+  geom_line(color = "red") +  # Connect points with lines
+  geom_point() +  # Show individual data points
+  labs(title = "Average Energy Consumption by Heating Setpoint",
+       x = "Heating Setpoint (°F)", y = "Average Total Energy Consumption (units)") +
+  ylim(1,2)+
+  theme_minimal()
+```
+
+```{r prepare for supervised model}
+# Load and condition the data
+df_supervised <- filtered_df
+# Create the binary classification column
+df_supervised$`over 1.0 kWh` <- ifelse(df_supervised$total_energy_consumption > 1.0, 1, 0) 
+df_supervised <- df_supervised[,!(names(df_supervised) %in% c("total_energy_consumption"))]
+
+# Partition the data into training and test sets
+set.seed(111)
+trainIndex <- createDataPartition(y=df_supervised$`over 1.0 kWh`, p=0.60, list=FALSE)
+trainSet <- df_supervised[trainIndex,]
+testSet <- df_supervised[-trainIndex,]
+```
+
+
+```{r Partition tree model}
+# Train the partition tree model
+model_rpart <- rpart(`over 1.0 kWh` ~ dry_bulb_temperature_c + direct_normal_radiation_w_m2 + relative_humidity_percent 
+              + hour + in_city 
+              + in_sqft
+              + in_lighting
+              + in_vacancy_status
+              + in_plug_load_diversity
+              + in_hvac_cooling_efficiency
+              + in_heating_fuel
+              + in_insulation_floor
+              + in_cooling_setpoint
+              + in_income_recs_2020
+              + in_pv_system_size
+              + in_geometry_stories
+              + in_ducts
+              + in_occupants
+              + in_vintage
+              + in_reeds_balancing_area
+              + in_weather_file_latitude
+              + in_bedrooms, data = trainSet, method="class")
+
+# Plot the tree
+rpart.plot(model_rpart)
+
+# Predict on the test set
+pred_rpart <- predict(model_rpart, newdata=testSet, type="class")
+
+# Evaluate the model
+confMatrix <- table(pred_rpart, testSet$`over 1.0 kWh`)
+# create a table of confusion matrix
+errorRate <- (sum(confMatrix)-sum(diag(confMatrix))) / sum(confMatrix)
+# calculate the error rate
+accuracy <- 1-errorRate
+accuracy 
+```
+
+```{r Logistic Regression}
+# glm() 
+model_glm <- glm(`over 1.0 kWh` ~ 
+              dry_bulb_temperature_c + direct_normal_radiation_w_m2 + relative_humidity_percent 
+              + hour + in_city 
+              + in_sqft
+              + in_lighting
+              + in_vacancy_status
+              + in_plug_load_diversity
+              + in_hvac_cooling_efficiency
+              + in_heating_fuel
+              + in_insulation_floor
+              + in_cooling_setpoint
+              + in_income_recs_2020
+              + in_pv_system_size
+              + in_geometry_stories
+              + in_ducts
+              + in_occupants
+              + in_vintage
+              + in_reeds_balancing_area
+              + in_weather_file_latitude
+              + in_bedrooms
+            , data = trainSet, family = binomial())
+
+# summary of the model
+summary(model_glm)
+
+# predictions
+predictions <- predict(model_glm, testSet, type = "response")
+
+# classify based on predictions
+predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+
+# Evaluate the model
+conf_matrix <- table(predicted_classes, testSet$`over 1.0 kWh`)
+# create a table of confusion matrix
+error_rate <- (sum(conf_matrix)-sum(diag(conf_matrix))) / sum(conf_matrix)
+# calculate the error rate
+accuracy_1 <- 1-error_rate
+accuracy_1
+```
+
+
+
+
+
+
+
